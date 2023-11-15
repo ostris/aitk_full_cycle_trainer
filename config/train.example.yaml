@@ -1,0 +1,75 @@
+---
+job: extension
+config:
+  name: "ddpm_fast_v01"
+  process:
+    - type: 'full_cycle_trainer'
+      training_folder: "Put path to save folder here"
+      steps_in_cycle: 2
+      device: cuda:0
+      performance_log_every: 100
+      network:
+        type: "lora"
+        linear: 32
+        linear_alpha: 32
+      save:
+        dtype: float16 # precision to save
+        save_every: 50 # save every this many steps
+        max_step_saves_to_keep: 4 # only affects step counts
+      datasets:
+        - folder_path: "path to generated dataset"
+          caption_ext: "txt"
+          num_repeats: 1
+          default_caption: ""
+          resolution: [ 512 ]
+          buckets: true
+          network_weight: 1.0
+
+      train:
+        batch_size: 1
+        gradient_accumulation_steps: 2
+        train_unet: true
+        train_text_encoder: false
+        steps: 100
+        gradient_checkpointing: false
+        noise_scheduler: "lcm"
+        lr: 6e-4
+        optimizer: "adamw8bit"
+        optimizer_params:
+          weight_decay: 1e-2
+        xformers: true
+        noise_offset: 0.0
+      model:
+        name_or_path: "runwayml/stable-diffusion-v1-5"
+        is_xl: false  # for SDXL models
+      sample:
+        sampler: "lcm"
+        sample_every: 10
+        width: 512
+        height: 512
+        prompts:
+          - "woman with red hair, playing chess at the park"
+          - "a woman holding a coffee cup, in a beanie"
+          - "woman in a night club dancing, at a bachelor party, fish eye lens, smoke machine, lazer lights, holding a martini, large group"
+          - "close up of an old womans face, side lighting, dramatic studio shot"
+          - "a bear dressed up in a human mask, standing in line at the dmv"
+          - "woman playing the guitar, on stage, singing a song, laser lights"
+          - "hipster man with a beard, building a chair"
+          - "suburban mom dressed as a 90s gangster for halloween, throwing a gang symbol with her hands"
+          - "man holding a taco in one hand and a pizza in the other"
+          - "a protester holding a sign that says eat more pizza"
+        neg: "nude, cartoon, fake, drawing, illustration, cgi, animated, anime"
+        seed: 42
+        walk_seed: true
+        guidance_scale: 1.0
+        sample_steps: 4
+        network_multiplier: 1.0
+
+      logging:
+        log_every: 10
+        use_wandb: false
+        verbose: false
+
+meta:
+  name: "[name]"
+  version: '1.0'
