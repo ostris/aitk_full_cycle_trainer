@@ -284,7 +284,7 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
                 # L2 Loss
                 loss_l2 = torch.nn.functional.mse_loss(
                     pred.float(),
-                    batch.latent.float()
+                    batch.latents.float()
                 ) * self.l2_weight
                 # Run through VGG19
                 if self.style_weight > 0 or self.content_weight > 0:
