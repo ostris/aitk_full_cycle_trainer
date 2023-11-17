@@ -1,13 +1,17 @@
 import math
+import os
 from collections import OrderedDict
-from random import random
+import random
 from typing import Union
 from diffusers import T2IAdapter, AutoencoderTiny
 from torch.utils.checkpoint import checkpoint
+from torchvision.transforms import v2
 
 from toolkit import train_tools
+from toolkit.basic import get_mean_std
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from toolkit.image_utils import show_tensors
+from PIL import Image
 from toolkit.prompt_utils import PromptEmbeds
 from toolkit.stable_diffusion_model import BlankNetwork
 from toolkit.style import get_style_model_and_losses
@@ -49,6 +53,9 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
         self.torch_dtype = get_torch_dtype(self.train_config.dtype)
         self.style_losses = []
         self.content_losses = []
+        self.sample_mean_std = None
+        self.mean_std_cache = []
+        self.max_cache_size = 20
         self.vgg19_pool_4 = None
 
     def setup_vgg19(self):
@@ -118,6 +125,39 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
             self.assistant_adapter.requires_grad_(False)
             flush()
 
+    @torch.no_grad()
+    def update_sample_mean_std(self):
+        sample_folder = os.path.join(self.save_root, 'samples')
+        if not os.path.exists(sample_folder):
+            return
+
+        num_samples = len(self.sample_config.prompts)
+        # find the latest num_samples images in the sample folder, (png or jpg)
+        sample_files = [os.path.join(sample_folder, f) for f in os.listdir(sample_folder) if
+                        os.path.splitext(f)[1].lower() in ['.png', '.jpg']]
+        if sample_files and len(sample_files) > 0:
+
+            sample_files.sort(key=os.path.getmtime)
+            sample_files = sample_files[-num_samples:]
+            avg_mean_std = None
+            for sample_file in sample_files:
+                # load as -1 to 1 torch tensor
+                img = adapter_transforms(Image.open(sample_file)).to(self.device_torch, dtype=self.torch_dtype)
+                mean, std = get_mean_std(img)
+                if avg_mean_std is None:
+                    avg_mean_std = mean, std
+                else:
+                    avg_mean_std = avg_mean_std[0] + mean, avg_mean_std[1] + std
+
+            avg_mean_std = avg_mean_std[0] / len(sample_files), avg_mean_std[1] / len(sample_files)
+
+            self.sample_mean_std = avg_mean_std
+
+    # override the sample function to run after it
+    def sample(self, step=None, is_first=False):
+        super().sample(step, is_first)
+        self.update_sample_mean_std()
+
     def hook_before_train_loop(self):
         # move vae to device if we did not cache latents
         if not self.is_latents_cached:
@@ -131,16 +171,19 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
 
         # get empty prompt embeds
         self.unconditional_prompt = self.sd.encode_prompt(
-            [self.negative_prompt] * self.train_config.batch_size, [self.negative_prompt] * self.train_config.batch_size,
+            [self.negative_prompt] * self.train_config.batch_size,
+            [self.negative_prompt] * self.train_config.batch_size,
             long_prompts=True
         ).to(
             self.device_torch,
             dtype=get_torch_dtype(self.train_config.dtype))
 
         if self.model_config.is_xl:
-            self.taesd = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=get_torch_dtype(self.train_config.dtype))
+            self.taesd = AutoencoderTiny.from_pretrained("madebyollin/taesdxl",
+                                                         torch_dtype=get_torch_dtype(self.train_config.dtype))
         else:
-            self.taesd = AutoencoderTiny.from_pretrained("madebyollin/taesd", torch_dtype=get_torch_dtype(self.train_config.dtype))
+            self.taesd = AutoencoderTiny.from_pretrained("madebyollin/taesd",
+                                                         torch_dtype=get_torch_dtype(self.train_config.dtype))
         self.taesd.to(dtype=self.torch_dtype, device=self.device_torch)
         self.taesd.eval()
         self.taesd.requires_grad_(False)
@@ -149,12 +192,12 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
             self.setup_vgg19()
             self.vgg_19.requires_grad_(False)
             self.vgg_19.eval()
-        flush()
 
+        self.update_sample_mean_std()
+        flush()
 
     def preprocess_batch(self, batch: 'DataLoaderBatchDTO'):
         return batch
-
 
     def before_unet_predict(self):
         pass
@@ -164,6 +207,70 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
 
     def end_of_training_loop(self):
         pass
+
+    def apply_inverse_standardization(self, tensor: torch.Tensor, scale_factor: float = 1.0):
+        input_tensor = tensor
+        # cache current mean_std for tensors
+        t = torch.chunk(tensor, tensor.shape[0], dim=0)
+        for chunk in t:
+            mean, std = get_mean_std(chunk)
+            if len(self.mean_std_cache) > self.max_cache_size:
+                self.mean_std_cache.pop(0)
+            self.mean_std_cache.append((mean, std))
+
+        # get ave mean_std from cache
+        avg_mean = 0
+        avg_std = 0
+        for m, s in self.mean_std_cache:
+            avg_mean += m
+            avg_std += s
+        avg_mean = avg_mean / len(self.mean_std_cache)
+        avg_std = avg_std / len(self.mean_std_cache)
+
+        if self.sample_mean_std is not None:
+            sample_mean, sample_std = self.sample_mean_std
+            # Adjusting normalization with scale factor
+            tensor = (tensor - sample_mean) / (sample_std * scale_factor)
+            # Adjusting denormalization with scale factor
+            tensor = tensor * (avg_std * scale_factor) + avg_mean
+        # if self.sample_mean_std is not None:
+        #     sample_mean, sample_std = self.sample_mean_std
+        #     # Adjusting normalization with scale factor
+        #     tensor = (tensor - avg_mean) / (avg_std * scale_factor)
+        #     # Adjusting denormalization with scale factor
+        #     tensor = tensor * (sample_std * scale_factor) + avg_std
+
+
+
+        return (tensor * 0.5) + (input_tensor * 0.5)
+
+    def augment_tensor(self, tensor: torch.Tensor):
+        # tensor = tensor * 0.5 + 0.5
+        # elastic_transformer = v2.ElasticTransform(alpha=250.0)
+        # jitter = v2.ColorJitter(brightness=.5, hue=.3)
+        # blurrer = v2.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5.))
+        # # equalizer = v2.RandomEqualize()
+        #
+        # # 1/4 the time, convert to grayscale
+        # if random.random() < 0.50:
+        #     tensor = v2.Grayscale(num_output_channels=3)(tensor)
+        #
+        # transforms_list = [elastic_transformer, jitter, blurrer]
+        # # shuffle
+        # random.shuffle(transforms_list)
+        #
+        # for transform in transforms_list:
+        #     tensor = transform(tensor)
+        #
+        # tensor = tensor * 2.0 - 1.0
+
+        # tensor = self.apply_inverse_standardization(tensor, 1.0)
+
+        # clip
+        tensor = torch.clamp(tensor, -1, 1)
+
+        return tensor
+
 
     def hook_train_loop(self, batch: 'DataLoaderBatchDTO'):
         if self.steps_in_cycle == 4 or self.steps_in_cycle == 2:
@@ -179,11 +286,23 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Steps in cycle {self.steps_in_cycle} not supported. Try 2, 3, or 4")
 
+       # since we are augmenting, set this lower
+       #  self.train_config.min_denoising_steps = self.train_config.min_denoising_steps // 4
+       #  self.train_config.max_denoising_steps = self.train_config.max_denoising_steps // 4
 
         self.timer.start('preprocess_batch')
         batch = self.preprocess_batch(batch)
         dtype = get_torch_dtype(self.train_config.dtype)
+        # we need to keep our target image and aument the source image before preprocessing
+        target_imgs = batch.tensor.clone().to(self.device_torch, dtype=self.torch_dtype)
+        augmented_imgs = self.augment_tensor(target_imgs.to(self.device_torch, dtype=torch.float32))
+        batch.tensor = (augmented_imgs.to(self.device_torch, dtype=self.torch_dtype) * 0.5) + (target_imgs * 0.5)
+
         noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
+        # replace the targets not that it is all encoded
+        imgs = target_imgs
+        batch.tensor = imgs
+
         network_weight_list = batch.get_network_weight_list()
 
         self.timer.stop('preprocess_batch')
@@ -239,7 +358,7 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
             self.before_unet_predict()
 
             with self.timer('predict_unet'):
-                self.sd.noise_scheduler.set_timesteps(self.steps_in_cycle)
+                self.sd.noise_scheduler.set_timesteps(self.steps_in_cycle, device=self.device_torch)
 
                 # randomly choose a decoder
                 # TAESD has normalizers on it  that can knock off the scaling factor
@@ -247,7 +366,7 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
                 # decoders = [self.sd.vae, self.taesd]
                 # decoders = [self.taesd]
                 decoders = [self.sd.vae]
-                decoder = decoders[math.floor(random() * len(decoders))]
+                decoder = decoders[math.floor(random.random() * len(decoders))]
 
                 pred = self.sd.diffuse_some_steps(
                     noisy_latents,  # pass simple noise latents
@@ -258,7 +377,7 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
                     ),
                     start_timesteps=start_step,
                     total_timesteps=self.steps_in_cycle,
-                    guidance_scale=1,
+                    guidance_scale=1.0,
                 )
                 latent_pred = pred.to(dtype=get_torch_dtype(self.train_config.dtype))
                 latent_pred = latent_pred / decoder.config['scaling_factor']
@@ -291,7 +410,6 @@ class SDFullCycleTrainer(BaseSDTrainProcess):
                     stacked = torch.cat([img_pred, imgs], dim=0)
                     stacked = (stacked / 2 + 0.5).clamp(0, 1)
                     self.vgg_19(stacked)
-                    # make sure we dont have nans
                     if torch.isnan(self.vgg19_pool_4.tensor).any():
                         raise ValueError('vgg19_pool_4 has nan values')
 
